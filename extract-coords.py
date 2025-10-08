@@ -6,13 +6,13 @@ extract-coords.py
 
 Features
 - Option A bootstrap (no PATH drama):
-  * Uses imageio-ffmpeg to resolve an ffmpeg binary automatically.
-  * Preflight checks for ffprobe and tesseract with friendly guidance.
-  * Env overrides: FFPROBE, TESSERACT_CMD.
+  * Tries env vars -> imageio-ffmpeg -> PATH to resolve ffmpeg.
+  * Preflight checks for ffprobe and tesseract with OS-specific guidance.
+  * Env overrides: FFMPEG, FFPROBE, TESSERACT_CMD.
 
 - Interactive mode selection:
   * "First frame only" per video (default).
-  * "Interval mode" -> user provides seconds (float) + optional safety cap on frames/video.
+  * "Interval mode" -> user provides seconds (float) + safety cap on frames/video.
 
 - Safety cap:
   * Prompt for max frames per video (default 500).
@@ -29,16 +29,18 @@ Features
 
 - Non-interactive ffmpeg (-y) to avoid overwrite prompts.
 
-Tested on Windows with Python 3.13.x
+Tested on Windows/macOS/Linux with Python 3.13.x
 """
 
 import os
 import re
+import sys
 import json
 import math
 import datetime
 import subprocess
 import shutil
+import platform
 from pathlib import Path
 from typing import Optional
 
@@ -71,10 +73,23 @@ INPUT_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".3gp"}
 SAVE_DEBUG_ROIS = False
 
 
-# ---------- Executables (Option A) ----------
-FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()  # resolved path from imageio-ffmpeg
-FFPROBE = os.environ.get("FFPROBE") or shutil.which("ffprobe")
-TESSERACT = os.environ.get("TESSERACT_CMD") or shutil.which("tesseract")
+# ---------- Executables (Option A, cross-platform) ----------
+# Prefer explicit env vars if set
+_FFMPEG_ENV   = os.environ.get("FFMPEG")
+_FFPROBE_ENV  = os.environ.get("FFPROBE")
+_TESS_ENV     = os.environ.get("TESSERACT_CMD")
+
+# Try imageio-ffmpeg; fall back to PATH if needed
+_FFMPEG_IMGIO = None
+try:
+    _FFMPEG_IMGIO = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    _FFMPEG_IMGIO = None
+
+# Final picks (in order): env -> imageio -> PATH
+FFMPEG    = _FFMPEG_ENV  or _FFMPEG_IMGIO or shutil.which("ffmpeg")
+FFPROBE   = _FFPROBE_ENV or shutil.which("ffprobe")
+TESSERACT = _TESS_ENV    or shutil.which("tesseract")
 
 # If TESSERACT is explicitly provided, wire it into pytesseract
 if TESSERACT:
@@ -86,23 +101,55 @@ if TESSERACT:
 
 def preflight_or_die():
     missing = []
-    if not FFMPEG or not os.path.exists(FFMPEG):
+
+    def _ok(x):
+        return bool(x and (os.path.exists(x) or shutil.which(str(x))))
+
+    if not _ok(FFMPEG):
         missing.append("ffmpeg")
-    if not FFPROBE:
+    if not _ok(FFPROBE):
         missing.append("ffprobe")
-    if not TESSERACT:
+    if not _ok(TESSERACT):
         missing.append("tesseract")
-    if missing:
-        print("❌ Missing required tools:", ", ".join(missing))
-        print("\nWindows quick install (PowerShell):")
+
+    if not missing:
+        return
+
+    print("❌ Missing required tools:", ", ".join(missing))
+    sysname = platform.system().lower()
+    print("\nQuick install suggestions:")
+
+    if "darwin" in sysname or "mac" in sysname:
+        # macOS
+        print("  # Homebrew")
+        print("  brew install ffmpeg")   # includes ffprobe
+        print("  brew install tesseract")
+        print("\n  # Optional: set explicit locations (no PATH needed)")
+        print("  export FFMPEG=$(which ffmpeg)")
+        print("  export FFPROBE=$(which ffprobe)")
+        print("  export TESSERACT_CMD=$(which tesseract)")
+    elif "windows" in sysname:
+        # Windows
         print("  winget install Gyan.FFmpeg")
         print("  winget install UB-Mannheim.Tesseract-OCR")
-        print("\nOr set explicit locations (no PATH needed):")
+        print("\n  # Optional: set explicit locations (no PATH needed)")
+        print(r"  setx FFMPEG  C:\ffmpeg\bin\ffmpeg.exe")
         print(r"  setx FFPROBE C:\ffmpeg\bin\ffprobe.exe")
         print(r"  setx TESSERACT_CMD C:\Program Files\Tesseract-OCR\tesseract.exe")
-        print("\nAlternatively, inside Python:")
-        print(r"  import pytesseract; pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'")
-        raise SystemExit(1)
+    else:
+        # Linux and others
+        print("  # Debian/Ubuntu")
+        print("  sudo apt-get update && sudo apt-get install -y ffmpeg tesseract-ocr")
+        print("  # Fedora")
+        print("  sudo dnf install -y ffmpeg tesseract")
+        print("\n  # Optional: set explicit locations (no PATH needed)")
+        print("  export FFMPEG=$(which ffmpeg)")
+        print("  export FFPROBE=$(which ffprobe)")
+        print("  export TESSERACT_CMD=$(which tesseract)")
+
+    print("\nAlternatively, inside Python:")
+    print(r"  import pytesseract; pytesseract.pytesseract.tesseract_cmd = '/usr/local/bin/tesseract'  # adjust as needed")
+    raise SystemExit(1)
 
 
 # ---------- Utilities ----------
