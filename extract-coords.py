@@ -298,7 +298,7 @@ def extract_gps_from_image(image_path: Path) -> tuple[Optional[float], Optional[
         (int(H * 0.86), H, 0,            W),
     ]
 
-    config = r'--psm 7 --oem 3 -c tessedit_char_whitelist=0123456789NSEW.:°\'" -l eng'
+    config = "--psm 7 --oem 3 -l eng"
     dbg_dir = image_path.parent / "debug_rois" if SAVE_DEBUG_ROIS else None
     if dbg_dir:
         ensure_dir(dbg_dir)
@@ -314,30 +314,30 @@ def extract_gps_from_image(image_path: Path) -> tuple[Optional[float], Optional[
         if dbg_dir:
             cv2.imwrite(str(dbg_dir / f"{image_path.stem}_{y1}-{y2}_{x1}-{x2}.png"), thr)
 
-        text = pytesseract.image_to_string(thr, config=config)
-        cleaned = (text.replace('O', '0').replace('o', '0')
-                        .replace('I', '1').replace('|', '1')
-                        .replace('S', '5'))
+        for candidate in (thr, cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)):
+            text = pytesseract.image_to_string(candidate, config=config)
+            cleaned = (text.replace('O', '0').replace('o', '0')
+                            .replace('I', '1').replace('|', '1'))
 
-        print("📄 OCR Output (candidate):")
-        print(cleaned.strip())
+            print("📄 OCR Output (candidate):")
+            print(cleaned.strip())
 
-        m = _DECIMAL_RE.search(cleaned)
-        if m:
-            hemi_lat, lat_s, hemi_lon, lon_s = m.groups()
-            lat = float(lat_s); lon = float(lon_s)
-            if hemi_lat.upper() == 'S': lat = -lat
-            if hemi_lon.upper() == 'W': lon = -lon
-            print(f"📍 Parsed (decimal): lat={lat}, lon={lon}")
-            return lat, lon
+            m = _DECIMAL_RE.search(cleaned)
+            if m:
+                hemi_lat, lat_s, hemi_lon, lon_s = m.groups()
+                lat = float(lat_s); lon = float(lon_s)
+                if hemi_lat.upper() == 'S': lat = -lat
+                if hemi_lon.upper() == 'W': lon = -lon
+                print(f"📍 Parsed (decimal): lat={lat}, lon={lon}")
+                return lat, lon
 
-        m = _DMS_RE.search(cleaned)
-        if m:
-            ns, d1, m1, s1, ew, d2, m2, s2 = m.groups()
-            lat = dms_to_decimal(d1, m1, s1, ns)
-            lon = dms_to_decimal(d2, m2, s2, ew)
-            print(f"📍 Parsed (DMS): lat={lat}, lon={lon}")
-            return lat, lon
+            m = _DMS_RE.search(cleaned)
+            if m:
+                ns, d1, m1, s1, ew, d2, m2, s2 = m.groups()
+                lat = dms_to_decimal(d1, m1, s1, ns)
+                lon = dms_to_decimal(d2, m2, s2, ew)
+                print(f"📍 Parsed (DMS): lat={lat}, lon={lon}")
+                return lat, lon
 
     print("⚠️ Could not extract GPS coordinates from OCR text.")
     return None, None
