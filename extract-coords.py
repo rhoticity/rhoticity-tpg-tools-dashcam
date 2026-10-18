@@ -404,7 +404,8 @@ def extract_gps_from_image(image_path: Path) -> tuple[Optional[float], Optional[
             for config in configs:
                 try:
                     text = pytesseract.image_to_string(candidate, config=config)
-                except pytesseract.TesseractError:
+                except pytesseract.TesseractError as exc:
+                    print(f"⚠️ Tesseract failed ({name}): {exc}")
                     continue
 
                 print("📄 OCR Output (candidate):")
