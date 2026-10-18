@@ -300,6 +300,7 @@ def _ocr_candidates(crop: np.ndarray, frame_height: int):
     video, so the main variants isolate small bright strokes and render them as
     black text on a white, padded background (what Tesseract expects).
     """
+    original = crop
     # Normalize scale so overlay text is roughly the same size for 1080p and 4K
     scale = max(1.0, 2160.0 / max(1, frame_height))
     if scale != 1.0:
@@ -327,7 +328,7 @@ def _ocr_candidates(crop: np.ndarray, frame_height: int):
     yield "otsu", _finish(otsu)
 
     # 4) Legacy adaptive threshold and raw grayscale
-    yield "adaptive", _preprocess_for_ocr(crop)
+    yield "adaptive", _preprocess_for_ocr(original)
     yield "gray", gray
 
 
@@ -398,7 +399,9 @@ def extract_gps_from_image(image_path: Path) -> tuple[Optional[float], Optional[
             if dbg_dir:
                 cv2.imwrite(str(dbg_dir / f"{image_path.stem}_{y1}-{y2}_{x1}-{x2}_{name}.png"), candidate)
 
-            for config in _OCR_CONFIGS:
+            # Limit Tesseract calls: try every config only on the primary variant
+            configs = _OCR_CONFIGS if name == "tophat" else _OCR_CONFIGS[:1]
+            for config in configs:
                 try:
                     text = pytesseract.image_to_string(candidate, config=config)
                 except pytesseract.TesseractError:
