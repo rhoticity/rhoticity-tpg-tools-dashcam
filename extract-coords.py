@@ -19,8 +19,9 @@ Features
   * Estimate frames from duration; if estimate > cap, limit with -frames:v CAP.
 
 - Robust OCR:
-  * Multi-ROI search (bottom-left, bottom-right, bottom strip).
-  * Upscale + hist eq + adaptive threshold + morphology.
+  * Multi-ROI search (tight bottom strips first, then wider fallbacks).
+  * Isolates bright overlay text (white top-hat, bright-pixel mask, Otsu),
+    falls back to adaptive threshold; GPS character whitelist for Tesseract.
   * Regex accepts decimal and DMS formats; common OCR char fixes.
 
 - EXIF writing:
@@ -177,7 +178,7 @@ def extract_first_frame(video_path: Path, frame_path: Path) -> bool:
     """
     cmd = [
         FFMPEG, "-y", "-i", str(video_path),
-        "-frames:v", "1", "-q:v", "2",
+        "-frames:v", "1", "-q:v", "2", "-update", "1",
         str(frame_path)
     ]
     subprocess.run(cmd, check=True, timeout=FFMPEG_TIMEOUT)
@@ -255,14 +256,24 @@ def extract_frames_interval(video_path: Path, out_dir: Path, interval_sec: float
 
 # ---------- OCR ----------
 _DECIMAL_RE = re.compile(
-    r'([NS])\s*[: ]?\s*([0-9]{1,3}\.[0-9]+)\D+([EW])\s*[: ]?\s*([0-9]{1,3}\.[0-9]+)',
+    r'([NS])\s*[:;., ]?\s*([0-9]{1,3}\.[0-9]+)\D*?([EW])\s*[:;., ]?\s*([0-9]{1,3}\.[0-9]+)',
     re.IGNORECASE
 )
 _DMS_RE = re.compile(
-    r'([NS])\s*([0-9]{1,3})[°:\s]\s*([0-9]{1,2})[\'’:\s]\s*([0-9]{1,2}(?:\.[0-9]+)?)["”]?\D+'
+    r'([NS])\s*([0-9]{1,3})[°:\s]\s*([0-9]{1,2})[\'’:\s]\s*([0-9]{1,2}(?:\.[0-9]+)?)["”]?\D*?'
     r'([EW])\s*([0-9]{1,3})[°:\s]\s*([0-9]{1,2})[\'’:\s]\s*([0-9]{1,2}(?:\.[0-9]+)?)["”]?',
     re.IGNORECASE
 )
+
+# Characters in a decimal dashcam GPS overlay (e.g., "N:40.2204 W:3.3302").
+# Keep quotes out of this: pytesseract shlex-splits the config string.
+_GPS_WHITELIST = "NSEW0123456789.:-"
+_OCR_CONFIGS = (
+    f"--psm 7 --oem 3 -l eng -c tessedit_char_whitelist={_GPS_WHITELIST}",
+    f"--psm 6 --oem 3 -l eng -c tessedit_char_whitelist={_GPS_WHITELIST}",
+    "--psm 7 --oem 3 -l eng",
+)
+
 
 def _preprocess_for_ocr(crop: np.ndarray) -> np.ndarray:
     """
@@ -282,9 +293,79 @@ def _preprocess_for_ocr(crop: np.ndarray) -> np.ndarray:
     return thr
 
 
+def _ocr_candidates(crop: np.ndarray, frame_height: int):
+    """
+    Yield (name, image) pairs of preprocessed versions of `crop`, most likely to
+    work first. Dashcam overlays are bright (white) text drawn directly on the
+    video, so the main variants isolate small bright strokes and render them as
+    black text on a white, padded background (what Tesseract expects).
+    """
+    # Normalize scale so overlay text is roughly the same size for 1080p and 4K
+    scale = max(1.0, 2160.0 / max(1, frame_height))
+    if scale != 1.0:
+        crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+    def _finish(binary_white_text: np.ndarray) -> np.ndarray:
+        img = cv2.bitwise_not(binary_white_text)
+        return cv2.copyMakeBorder(img, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+
+    # 1) White top-hat: keeps thin bright strokes, removes bright reflections/sky
+    k = 31
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT,
+                              cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)))
+    _, th_bin = cv2.threshold(tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    yield "tophat", _finish(th_bin)
+
+    # 2) Bright-pixel mask: overlay text is (near) white and low saturation
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    bright = cv2.inRange(hsv, (0, 0, 200), (180, 60, 255))
+    yield "bright", _finish(bright)
+
+    # 3) Otsu on grayscale
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    yield "otsu", _finish(otsu)
+
+    # 4) Legacy adaptive threshold and raw grayscale
+    yield "adaptive", _preprocess_for_ocr(crop)
+    yield "gray", gray
+
+
+def _clean_ocr_text(text: str) -> str:
+    return (text.replace('O', '0').replace('o', '0')
+                .replace('I', '1').replace('|', '1').replace('l', '1')
+                .replace(',', '.') if text else "")
+
+
+def parse_gps_text(text: str) -> tuple[Optional[float], Optional[float]]:
+    """
+    Parse decimal (e.g., "N:40.2204 W:3.3302") or DMS coordinates from OCR text.
+    Returns (lat, lon) or (None, None) if nothing valid was found.
+    """
+    cleaned = _clean_ocr_text(text)
+
+    for m in _DECIMAL_RE.finditer(cleaned):
+        hemi_lat, lat_s, hemi_lon, lon_s = m.groups()
+        lat = float(lat_s); lon = float(lon_s)
+        if hemi_lat.upper() == 'S': lat = -lat
+        if hemi_lon.upper() == 'W': lon = -lon
+        if abs(lat) <= 90 and abs(lon) <= 180:
+            return lat, lon
+
+    for m in _DMS_RE.finditer(cleaned):
+        ns, d1, m1, s1, ew, d2, m2, s2 = m.groups()
+        lat = dms_to_decimal(d1, m1, s1, ns)
+        lon = dms_to_decimal(d2, m2, s2, ew)
+        if abs(lat) <= 90 and abs(lon) <= 180:
+            return lat, lon
+
+    return None, None
+
+
 def extract_gps_from_image(image_path: Path) -> tuple[Optional[float], Optional[float]]:
     """
-    Try multiple bottom ROIs, run OCR, and parse decimal or DMS coordinates.
+    Try multiple bottom ROIs and preprocessing variants, run OCR, and parse
+    decimal or DMS coordinates.
     """
     img = cv2.imread(str(image_path))
     if img is None:
@@ -293,12 +374,15 @@ def extract_gps_from_image(image_path: Path) -> tuple[Optional[float], Optional[
 
     H, W = img.shape[:2]
     rois = [
-        (int(H * 0.84), H, 0,            int(W * 0.50)),
+        # Tight strips along the very bottom (where dashcams draw the overlay)
+        (int(H * 0.93), H, 0,             int(W * 0.50)),
+        (int(H * 0.93), H, int(W * 0.50), W),
+        # Wider fallbacks
+        (int(H * 0.84), H, 0,             int(W * 0.50)),
         (int(H * 0.84), H, int(W * 0.50), W),
-        (int(H * 0.86), H, 0,            W),
+        (int(H * 0.86), H, 0,             W),
     ]
 
-    config = "--psm 7 --oem 3 -l eng"
     dbg_dir = image_path.parent / "debug_rois" if SAVE_DEBUG_ROIS else None
     if dbg_dir:
         ensure_dir(dbg_dir)
@@ -310,34 +394,23 @@ def extract_gps_from_image(image_path: Path) -> tuple[Optional[float], Optional[
         if crop.size == 0:
             continue
 
-        thr = _preprocess_for_ocr(crop)
-        if dbg_dir:
-            cv2.imwrite(str(dbg_dir / f"{image_path.stem}_{y1}-{y2}_{x1}-{x2}.png"), thr)
+        for name, candidate in _ocr_candidates(crop, H):
+            if dbg_dir:
+                cv2.imwrite(str(dbg_dir / f"{image_path.stem}_{y1}-{y2}_{x1}-{x2}_{name}.png"), candidate)
 
-        for candidate in (thr, cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)):
-            text = pytesseract.image_to_string(candidate, config=config)
-            cleaned = (text.replace('O', '0').replace('o', '0')
-                            .replace('I', '1').replace('|', '1'))
+            for config in _OCR_CONFIGS:
+                try:
+                    text = pytesseract.image_to_string(candidate, config=config)
+                except pytesseract.TesseractError:
+                    continue
 
-            print("📄 OCR Output (candidate):")
-            print(cleaned.strip())
+                print("📄 OCR Output (candidate):")
+                print(" ".join(text.split()))
 
-            m = _DECIMAL_RE.search(cleaned)
-            if m:
-                hemi_lat, lat_s, hemi_lon, lon_s = m.groups()
-                lat = float(lat_s); lon = float(lon_s)
-                if hemi_lat.upper() == 'S': lat = -lat
-                if hemi_lon.upper() == 'W': lon = -lon
-                print(f"📍 Parsed (decimal): lat={lat}, lon={lon}")
-                return lat, lon
-
-            m = _DMS_RE.search(cleaned)
-            if m:
-                ns, d1, m1, s1, ew, d2, m2, s2 = m.groups()
-                lat = dms_to_decimal(d1, m1, s1, ns)
-                lon = dms_to_decimal(d2, m2, s2, ew)
-                print(f"📍 Parsed (DMS): lat={lat}, lon={lon}")
-                return lat, lon
+                lat, lon = parse_gps_text(text)
+                if lat is not None and lon is not None:
+                    print(f"📍 Parsed: lat={lat}, lon={lon}")
+                    return lat, lon
 
     print("⚠️ Could not extract GPS coordinates from OCR text.")
     return None, None
